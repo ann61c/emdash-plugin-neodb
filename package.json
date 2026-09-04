@@ -1,0 +1,27 @@
+{
+  "name": "emdash-plugin-neodb",
+  "version": "0.1.0",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ann61c/emdash-plugin-neodb"
+  },
+  "homepage": "https://github.com/ann61c/emdash-plugin-neodb#readme",
+  "bugs": "https://github.com/ann61c/emdash-plugin-neodb/issues",
+  "exports": {
+    ".": "./src/index.ts",
+    "./astro": "./src/astro/index.ts",
+    "./admin": "./src/admin.tsx"
+  },
+  "files": [
+    "src/",
+    "README.md",
+    "LICENSE"
+  ],
+  "peerDependencies": {
+    "emdash": "^0.36.0",
+    "react": "^19.2.8",
+    "astro": "^6.4.8"
+  }
+}

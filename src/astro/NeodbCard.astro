@@ -1,0 +1,113 @@
+---
+import { getImage } from 'astro:assets';
+import { TYPE_LABEL } from '../types';
+
+type Link = { url?: string; name?: string; class?: string };
+type Mark = { date?: string; status?: string; rating?: number | null; comment?: string };
+type Node = {
+  url?: string;
+  title?: string;
+  year?: string | number;
+  rating?: number;
+  cover?: string;
+  coverKey?: string;
+  kind?: string;
+  brief?: string;
+  itemUrl?: string;
+  origTitle?: string;
+  links?: Link[];
+  metaBits?: string[];
+  mark?: Mark;
+  error?: string;
+};
+
+function httpOnly(value: string): string {
+  try {
+    const p = new URL(value).protocol;
+    return p === 'http:' || p === 'https:' ? value : '';
+  } catch {
+    return '';
+  }
+}
+
+const node = ((Astro.props as { node?: Node }).node ?? {}) as Node;
+const title = String(node.title ?? '');
+const url = httpOnly(String(node.itemUrl || node.url || ''));
+const year = String(node.year ?? '');
+const kind = String(node.kind ?? '');
+const typeLabel = TYPE_LABEL[kind] ?? TYPE_LABEL[kind.split('/')[0]] ?? '';
+const rating = typeof node.rating === 'number' && Number.isFinite(node.rating) ? node.rating : 0;
+const origTitle = String(node.origTitle ?? '').trim();
+const showSubtitle = Boolean(origTitle && origTitle !== title);
+const links = Array.isArray(node.links)
+  ? node.links.filter((link) => httpOnly(String(link.url ?? '')) && String(link.name ?? '').trim())
+  : [];
+const metaBits = Array.isArray(node.metaBits) ? node.metaBits.map((bit) => String(bit)).filter(Boolean) : [];
+const mark = node.mark && typeof node.mark === 'object' ? node.mark : undefined;
+const markDate = String(mark?.date ?? '').trim();
+const markStatus = String(mark?.status ?? '').trim();
+const markRating =
+  typeof mark?.rating === 'number' && Number.isFinite(mark.rating) && mark.rating > 0 ? mark.rating : null;
+const viewTime = markDate && markStatus
+  ? `${markDate} ${markStatus}${markRating !== null ? ` ${markRating}分` : ''}`
+  : '';
+const comment = String(mark?.comment ?? '').trim();
+const brief = String(node.brief ?? '').trim();
+const abstract = comment || brief;
+const coverKey = typeof node.coverKey === 'string' ? node.coverKey : '';
+const resolve = (Astro.locals as { emdash?: { getPublicMediaUrl?: (key: string) => string } }).emdash
+  ?.getPublicMediaUrl;
+let poster: { src: string; srcset: string } | null = null;
+if (coverKey) {
+  if (!resolve) throw new Error('media url resolver missing (Astro.locals.emdash.getPublicMediaUrl)');
+  const src = resolve(coverKey);
+  const [one, two] = await Promise.all([
+    getImage({ src, width: 96, height: 128, fit: 'cover' }),
+    getImage({ src, width: 192, height: 256, fit: 'cover' }),
+  ]);
+  poster = { src: one.src, srcset: `${one.src} 1x, ${two.src} 2x` };
+}
+const showMeta = rating > 0 || metaBits.length > 0;
+const fallback = Boolean(node.error) || !title;
+---
+{fallback ? (
+  url ? (
+    <p>
+      <a href={url}>{url}</a>
+    </p>
+  ) : null
+) : (
+  <div class="doulist-item">
+    <div class="doulist-subject">
+      {poster && (
+        <div class="doulist-post">
+          <img decoding="async" src={poster.src} srcset={poster.srcset} sizes="96px" width="96" height="128" alt="" />
+        </div>
+      )}
+      {viewTime && <div class="db--viewTime JiEun">{viewTime}</div>}
+      <div class="doulist-content">
+        <div class="doulist-title-header">
+          <a href={url} class="doulist-title cute" target="_blank" rel="external nofollow">{title}</a>
+          {year && <span class="doulist-year">({year})</span>}
+          {typeLabel && <span class="doulist-category">[{typeLabel}]</span>}
+          {links.length > 0 && (
+            <span class="site-list">
+              {links.map((link) => (
+                <a href={httpOnly(String(link.url))} class={String(link.class ?? 'external')} target="_blank" rel="noopener noreferrer">{String(link.name)}</a>
+              ))}
+            </span>
+          )}
+        </div>
+        {showSubtitle && <div class="doulist-subtitle">{origTitle}</div>}
+        {showMeta && (
+          <div class="doulist-meta-line">
+            {rating > 0 && <span class="rating-score">{rating}</span>}
+            {rating > 0 && metaBits.length > 0 && ' / '}
+            {metaBits.join(' / ')}
+          </div>
+        )}
+        {abstract && <div class="abstract">{abstract}</div>}
+      </div>
+    </div>
+  </div>
+)}
