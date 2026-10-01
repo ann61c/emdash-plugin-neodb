@@ -40,7 +40,7 @@ export function applySnapshot(block: Record<string, unknown>, snap: ItemSnapshot
   block.origTitle = snap.origTitle;
   block.links = snap.links;
   block.metaBits = snap.metaBits;
-  if (snap.mark) block.mark = snap.mark;
+  if (snap.mark?.visibility === 0) block.mark = snap.mark;
   else delete block.mark;
   block.snapshotVersion = SNAPSHOT_VERSION;
   block.resolvedAt = new Date().toISOString();

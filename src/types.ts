@@ -7,6 +7,7 @@ export type ItemLink = {
 };
 
 export type ItemMark = {
+  visibility: 0;
   date: string;
   status: string;
   rating: number | null;

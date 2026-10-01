@@ -47,6 +47,7 @@
 | 设置 | 必填 | 说明 |
 |---|---|---|
 | `token` | 是 | NeoDB 个人 API token。在 [neodb.social/settings/](https://neodb.social/settings/) 页面「API Token」处创建。没有它,shelf 路由与个人标记抓取会直接报错。 |
+| `mediaToken` | 是 | EmDash API token，仅授予 `media:read`、`media:write`，用于把新上传和复用的封面归入 `neodb-posters`，不依赖访客登录。 |
 | `language` | 否 | 请求 NeoDB API 的 `Accept-Language`,影响返回的标题与简介语言。默认 `zh-CN`(可选 `en`)。 |
 | `posterUrlTemplate` | 否 | shelf 海报 URL 模板,见下。 |
 

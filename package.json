@@ -1,6 +1,6 @@
 {
   "name": "emdash-plugin-neodb",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "license": "MIT",
   "repository": {
@@ -20,7 +20,7 @@
     "LICENSE"
   ],
   "peerDependencies": {
-    "emdash": "^0.36.0",
+    "emdash": "^1.0.1",
     "react": "^19.2.8",
     "astro": "^6.4.8"
   }

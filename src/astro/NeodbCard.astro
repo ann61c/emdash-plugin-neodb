@@ -3,7 +3,7 @@ import { getImage } from 'astro:assets';
 import { TYPE_LABEL } from '../types';
 
 type Link = { url?: string; name?: string; class?: string };
-type Mark = { date?: string; status?: string; rating?: number | null; comment?: string };
+type Mark = { visibility?: number; date?: string; status?: string; rating?: number | null; comment?: string };
 type Node = {
   url?: string;
   title?: string;
@@ -43,7 +43,7 @@ const links = Array.isArray(node.links)
   ? node.links.filter((link) => httpOnly(String(link.url ?? '')) && String(link.name ?? '').trim())
   : [];
 const metaBits = Array.isArray(node.metaBits) ? node.metaBits.map((bit) => String(bit)).filter(Boolean) : [];
-const mark = node.mark && typeof node.mark === 'object' ? node.mark : undefined;
+const mark = node.mark?.visibility === 0 ? node.mark : undefined;
 const markDate = String(mark?.date ?? '').trim();
 const markStatus = String(mark?.status ?? '').trim();
 const markRating =

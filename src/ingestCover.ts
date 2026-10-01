@@ -68,6 +68,7 @@ async function restJson(
 ): Promise<{ status: number; json: Record<string, unknown> | null }> {
   const res = await fetch(`${internalOrigin()}${path}`, {
     ...init,
+    signal: AbortSignal.timeout(FETCH_MS),
     headers: { ...restHeaders(auth), ...(init?.headers as Record<string, string> | undefined) },
   });
   let json: Record<string, unknown> | null = null;
@@ -137,8 +138,7 @@ async function ensureFolder(ctx: PluginContext, auth?: Headers): Promise<string 
     await ctx.kv.set(FOLDER_KV, item.id);
     return item.id;
   }
-  ctx.log.warn(`neodb-posters folder skipped: ${created.status}`);
-  return undefined;
+  throw new Error(`neodb poster folder creation failed: ${created.status}`);
 }
 
 async function assignFolder(mediaId: string, folderId: string, auth?: Headers): Promise<void> {
@@ -148,8 +148,7 @@ async function assignFolder(mediaId: string, folderId: string, auth?: Headers): 
     body: JSON.stringify({ folderId }),
   });
   if (status >= 300) {
-    // Public shelf has no session; skip folder assignment rather than fail the card.
-    return;
+    throw new Error(`neodb poster folder assignment failed: ${status}`);
   }
 }
 
@@ -160,15 +159,22 @@ export async function ingestCover(
   auth?: Headers,
 ): Promise<PosterRef> {
   if (!uuid) throw new Error('neodb uuid missing for poster ingest');
+  // Folder REST operations need a service credential even during anonymous shelf reads.
+  const token = String((await ctx.kv.get('settings:mediaToken')) ?? '').trim();
+  if (token) auth = new Headers({ Authorization: `Bearer ${token}` });
+  if (!auth?.get('Authorization') && !auth?.get('Cookie')) {
+    throw new Error('neodb plugin setting "mediaToken" is required for poster archiving');
+  }
+  const folderId = await ensureFolder(ctx, auth);
+  if (!folderId) throw new Error('neodb poster folder missing');
   const media = mediaNeed(ctx);
   const remembered = (await ctx.kv.get(kvKey(uuid))) as StoredPoster | null;
   if (remembered?.mediaId && remembered.storageKey) {
     const still = await media.get(remembered.mediaId);
     if (still) {
       const ref = { coverKey: remembered.storageKey, coverMediaId: remembered.mediaId, uploaded: false };
+      await assignFolder(remembered.mediaId, folderId, auth);
       await rememberOnItem(ctx, uuid, ref);
-      const folderId = await ensureFolder(ctx, auth);
-      if (folderId) await assignFolder(remembered.mediaId, folderId, auth);
       return ref;
     }
   }
@@ -177,6 +183,7 @@ export async function ingestCover(
   if (existing) {
     await ctx.kv.set(kvKey(uuid), existing);
     const ref = { coverKey: existing.storageKey, coverMediaId: existing.mediaId, uploaded: false };
+    await assignFolder(existing.mediaId, folderId, auth);
     await rememberOnItem(ctx, uuid, ref);
     return ref;
   }
@@ -205,8 +212,7 @@ export async function ingestCover(
   const uploaded = await media.upload(filename, mime, bytes);
   const stored: StoredPoster = { mediaId: uploaded.mediaId, storageKey: uploaded.storageKey };
   await ctx.kv.set(kvKey(uuid), stored);
-  const folderId = await ensureFolder(ctx, auth);
-  if (folderId) await assignFolder(uploaded.mediaId, folderId, auth);
+  await assignFolder(uploaded.mediaId, folderId, auth);
   const ref = { coverKey: uploaded.storageKey, coverMediaId: uploaded.mediaId, uploaded: true };
   await rememberOnItem(ctx, uuid, ref);
   return ref;

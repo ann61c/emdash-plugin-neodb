@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { z } from 'astro/zod';
 import { PluginRouteError, type PluginContext, type RouteContext } from 'emdash';
 import { ingestCover, posterUrls } from './ingestCover';
@@ -56,7 +57,23 @@ function shelfStore(ctx: PluginContext) {
   return ctx.storage.shelf as {
     get(id: string): Promise<ShelfPage | null>;
     put(id: string, data: ShelfPage): Promise<void>;
+    deleteMany(ids: string[]): Promise<number>;
+    query(options: { limit: number; cursor?: string }): Promise<{
+      items: Array<{ id: string }>;
+      cursor?: string;
+      hasMore: boolean;
+    }>;
   };
+}
+
+export async function clearShelfCache(ctx: PluginContext): Promise<void> {
+  const store = shelfStore(ctx);
+  let cursor: string | undefined;
+  do {
+    const page = await store.query({ limit: 1000, cursor });
+    if (page.items.length) await store.deleteMany(page.items.map((item) => item.id));
+    cursor = page.hasMore ? page.cursor : undefined;
+  } while (cursor);
 }
 
 function itemsStore(ctx: PluginContext) {
@@ -78,12 +95,13 @@ async function yearFor(ctx: PluginContext, itemUrl: string, uuid: string, catego
 }
 
 type UpstreamMark = {
+  visibility?: unknown;
   rating_grade?: unknown;
   created_time?: unknown;
   item?: Record<string, unknown> | null;
 };
 
-async function mapMark(ctx: PluginContext, row: UpstreamMark): Promise<ShelfCard | null> {
+async function mapMark(ctx: PluginContext, row: UpstreamMark, enrich = true): Promise<ShelfCard | null> {
   const item = row.item;
   if (!item || typeof item !== 'object') return null;
   const uuid = typeof item.uuid === 'string' ? item.uuid : '';
@@ -92,10 +110,10 @@ async function mapMark(ctx: PluginContext, row: UpstreamMark): Promise<ShelfCard
   const title = String(item.display_title || item.title || uuid);
   const remote = typeof item.cover_image_url === 'string' ? item.cover_image_url : '';
   const itemUrl = typeof item.url === 'string' ? item.url : '';
-  const year = await yearFor(ctx, itemUrl || `https://neodb.social/${category}/${uuid}`, uuid, category);
-  const cached = await itemsStore(ctx).get(uuid);
+  const year = enrich ? await yearFor(ctx, itemUrl || `https://neodb.social/${category}/${uuid}`, uuid, category) : '';
+  const cached = enrich ? await itemsStore(ctx).get(uuid) : null;
   let coverKey = cached?.coverKey;
-  if (!coverKey && remote) {
+  if (enrich && !coverKey && remote) {
     const auth = 'request' in ctx ? (ctx as { request?: Request }).request?.headers : undefined;
     const poster = await ingestCover(ctx, uuid, remote, auth);
     coverKey = poster.coverKey;
@@ -129,19 +147,28 @@ async function fetchUpstream(
   status: ShelfStatus,
   page: number,
   token: string,
+  language: string,
 ): Promise<ShelfPage | null> {
   if (!ctx.http) return null;
   const category = TYPE_TO_CATEGORY[type];
   const api = `https://neodb.social/api/me/shelf/${status}?category=${category}&page=${page}`;
   ctx.log.info(`shelf ${type}/${status}/${page}`);
-  const res = await ctx.http.fetch(api, {
-    headers: {
-      Accept: 'application/json',
-      'Accept-Language': await languageOf(ctx),
-      Authorization: `Bearer ${token}`,
-      'User-Agent': UA,
-    },
-  });
+  const started = Date.now();
+  let res: Response;
+  try {
+    res = await ctx.http.fetch(api, {
+      signal: AbortSignal.timeout(8000),
+      headers: {
+        Accept: 'application/json',
+        'Accept-Language': language,
+        Authorization: `Bearer ${token}`,
+        'User-Agent': UA,
+      },
+    });
+  } catch (err) {
+    ctx.log.warn(`fetch ${api} failed after ${Date.now() - started}ms: ${err instanceof Error ? err.message : String(err)}`);
+    throw err;
+  }
   if (!res.ok) {
     ctx.log.info(`fail shelf ${type}/${status}/${page}`);
     return null;
@@ -153,13 +180,31 @@ async function fetchUpstream(
     ctx.log.info(`fail shelf ${type}/${status}/${page}`);
     return null;
   }
-  const rows = Array.isArray(payload.data) ? (payload.data as UpstreamMark[]) : [];
-  const mapped = (await Promise.all(rows.map((row) => mapMark(ctx, row)))).filter(
+  if (!payload || !Array.isArray(payload.data) ||
+      !Number.isInteger(payload.pages) || Number(payload.pages) < 0 ||
+      !Number.isInteger(payload.count) || Number(payload.count) < 0 ||
+      !payload.data.every((row: unknown) => row && typeof row === 'object' &&
+        [0, 1, 2].includes((row as UpstreamMark).visibility as number) &&
+        typeof (row as UpstreamMark).item?.uuid === 'string' && (row as UpstreamMark).item?.uuid)) {
+    return null;
+  }
+  const rows = (payload.data as UpstreamMark[]).filter((row) => row.visibility === 0);
+  let partial = false;
+  const mapped = (await Promise.all(rows.map(async (row) => {
+    try {
+      return await mapMark(ctx, row);
+    } catch (error) {
+      partial = true;
+      ctx.log.warn(`shelf item ${String(row.item?.uuid ?? '')}: ${error instanceof Error ? error.message : String(error)}`);
+      return mapMark(ctx, row, false);
+    }
+  }))).filter(
     (row): row is ShelfCard => row !== null,
   );
   const pages = typeof payload.pages === 'number' && payload.pages > 0 ? payload.pages : mapped.length ? page : 0;
-  const count = typeof payload.count === 'number' ? payload.count : mapped.length;
-  return { ok: true, page, pages, count, items: mapped, fetchedAt: Date.now() };
+  // Only report this page's public items; upstream totals include restricted marks.
+  const count = mapped.length;
+  return { ok: true, page, pages, count, items: mapped, fetchedAt: partial ? undefined : Date.now() };
 }
 
 export async function shelfHandler(ctx: RouteContext) {
@@ -167,14 +212,18 @@ export async function shelfHandler(ctx: RouteContext) {
     throw new PluginRouteError('METHOD_NOT_ALLOWED', 'GET only', 405);
   }
   const { type, status, page } = shelfInput.parse(ctx.input);
+  const internalToken = await ctx.kv.get<string>('settings:internalToken');
+  const internal = internalToken && ctx.request.headers.get('X-Hera-Internal') === internalToken;
   const ip = ctx.requestMeta.ip || 'unknown';
-  if (rateLimited(`shelf:${ip}`, 60)) {
+  if (!internal && rateLimited(`shelf:${ip}`, 60)) {
     throw new PluginRouteError('RATE_LIMITED', 'rate limited', 429);
   }
 
   const token = await tokenOf(ctx);
+  const language = await languageOf(ctx);
 
-  const key = `v5:${type}:${status}:${page}`;
+  const account = createHash('sha256').update(token).digest('hex').slice(0, 12);
+  const key = `v7-public:${account}:${language}:${type}:${status}:${page}`;
   const cached = await shelfStore(ctx).get(key);
   if (cached?.ok && cached.fetchedAt && Date.now() - cached.fetchedAt < SHELF_TTL_MS) {
     ctx.log.info(`shelf-cache ${type}/${status}/${page}`);
@@ -187,9 +236,9 @@ export async function shelfHandler(ctx: RouteContext) {
     };
   }
 
-  const fetched = await fetchUpstream(ctx, type, status, page, token);
+  const fetched = await fetchUpstream(ctx, type, status, page, token, language);
   if (!fetched) return emptyPage(page);
-  await shelfStore(ctx).put(key, fetched);
+  if (fetched.fetchedAt) await shelfStore(ctx).put(key, fetched);
   return {
     ok: fetched.ok,
     page: fetched.page,

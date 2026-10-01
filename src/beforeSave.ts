@@ -12,6 +12,16 @@ type ContentEvent = {
 
 type Block = Record<string, unknown>;
 
+export function* blocks(value: unknown): Generator<Block> {
+  if (!Array.isArray(value)) return;
+  for (const item of value) {
+    if (!item || typeof item !== 'object') continue;
+    const block = item as Block;
+    yield block;
+    for (const field of ['children', 'content', 'columns']) yield* blocks(block[field]);
+  }
+}
+
 function uuidOf(snapItemUrl: string, fallbackUrl: string): string {
   const fromSnap = parseNeodbUrl(snapItemUrl)?.uuid;
   if (fromSnap) return fromSnap;
@@ -22,13 +32,11 @@ function uuidOf(snapItemUrl: string, fallbackUrl: string): string {
 
 export async function beforeSave(event: ContentEvent, ctx: PluginContext) {
   const content = event.content;
-  if (event.collection !== 'posts') return content;
+  if (event.collection !== 'posts' && event.collection !== 'pages') return content;
   const pt = content.content;
   if (!Array.isArray(pt)) return content;
 
-  for (const raw of pt) {
-    if (!raw || typeof raw !== 'object') continue;
-    const block = raw as Block;
+  for (const block of blocks(pt)) {
     if (block._type !== 'neodb') continue;
     const url = String(block.url ?? '').trim();
     if (!url) {

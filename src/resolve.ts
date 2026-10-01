@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import type { PluginContext } from 'emdash';
 import { parseCardUrl, parseNeodbUrl } from './parse';
 import { languageOf, tokenOf } from './settings';
@@ -224,6 +225,7 @@ function markOf(data: JsonRecord): ItemMark | undefined {
         ? Number(gradeRaw)
         : null;
   return {
+    visibility: 0,
     date: created,
     status,
     rating: grade,
@@ -255,16 +257,18 @@ export function mapItem(data: JsonRecord, typeHint = '', uuidHint = ''): ItemSna
   };
 }
 
+type CachedSnapshot = ItemSnapshot & { cacheScope?: string };
+
 function items(ctx: PluginContext) {
   return ctx.storage.items as {
-    get(id: string): Promise<ItemSnapshot | null>;
-    put(id: string, data: ItemSnapshot): Promise<void>;
+    get(id: string): Promise<CachedSnapshot | null>;
+    put(id: string, data: CachedSnapshot): Promise<void>;
   };
 }
 
-function fresh(snap: ItemSnapshot | null): snap is ItemSnapshot {
+function fresh(snap: CachedSnapshot | null, scope: string): snap is CachedSnapshot {
   return Boolean(
-    snap && snap.snapshotVersion === SNAPSHOT_VERSION && Date.now() - snap.fetchedAt < ITEMS_TTL_MS,
+    snap && snap.cacheScope === scope && snap.snapshotVersion === SNAPSHOT_VERSION && Date.now() - snap.fetchedAt < ITEMS_TTL_MS,
   );
 }
 
@@ -281,33 +285,49 @@ function asRecord(value: unknown): JsonRecord | null {
   return value as JsonRecord;
 }
 
+type RequestSettings = { token: string; language: string };
+
 async function neodbGet(
   ctx: PluginContext,
   url: string,
   auth: boolean,
+  settings: RequestSettings,
 ): Promise<{ status: number; data: JsonRecord | null }> {
   if (!ctx.http) return { status: 0, data: null };
   const headers: Record<string, string> = {
     Accept: 'application/json',
-    'Accept-Language': await languageOf(ctx),
+    'Accept-Language': settings.language,
     'User-Agent': UA,
   };
   if (auth) {
-    headers.Authorization = `Bearer ${await tokenOf(ctx)}`;
+    headers.Authorization = `Bearer ${settings.token}`;
   }
-  const res = await ctx.http.fetch(url, { headers });
+  const started = Date.now();
+  let res: Response;
+  try {
+    res = await ctx.http.fetch(url, { headers, signal: AbortSignal.timeout(8000) });
+  } catch (err) {
+    ctx.log.warn(`fetch ${url} failed after ${Date.now() - started}ms: ${err instanceof Error ? err.message : String(err)}`);
+    throw err;
+  }
   return { status: res.status, data: asRecord(await readJson(res)) };
 }
 
-async function withMark(ctx: PluginContext, snap: ItemSnapshot, uuid: string): Promise<ItemSnapshot> {
-  const { status, data } = await neodbGet(ctx, `https://neodb.social/api/me/shelf/item/${uuid}`, true);
-  if (status === 404 || !data) return snap;
-  if (status !== 200) {
-    ctx.log.info(`fail mark ${uuid}`);
-    return snap;
-  }
+async function withMark(ctx: PluginContext, snap: ItemSnapshot, uuid: string, settings: RequestSettings): Promise<ItemSnapshot> {
+  const { status, data } = await neodbGet(ctx, `https://neodb.social/api/me/shelf/item/${uuid}`, true, settings);
+  if (status === 404) return snap;
+  if (status !== 200) throw new Error(`neodb mark ${uuid}: HTTP ${status}`);
+  if (!data || ![0, 1, 2].includes(data.visibility as number)) throw new Error(`neodb mark ${uuid}: invalid visibility`);
+  if (data.visibility !== 0) return snap;
   const mark = markOf(data);
-  if (mark) snap.mark = mark;
+  const grade = data.rating_grade;
+  const validGrade = grade == null ||
+    ((typeof grade === 'number' || typeof grade === 'string') && Number.isFinite(Number(grade)));
+  if (!mark || !Number.isFinite(Date.parse(mark.date)) || !validGrade ||
+      (data.comment_text != null && typeof data.comment_text !== 'string')) {
+    throw new Error(`neodb mark ${uuid}: invalid response`);
+  }
+  snap.mark = mark;
   return snap;
 }
 
@@ -325,11 +345,11 @@ function pollUrlOf(data: JsonRecord | null, status: number): string | null {
   }
 }
 
-async function catalogFetch(ctx: PluginContext, itemUrl: string): Promise<JsonRecord | null> {
+async function catalogFetch(ctx: PluginContext, itemUrl: string, settings: RequestSettings): Promise<JsonRecord | null> {
   const first = `https://neodb.social/api/catalog/fetch?url=${encodeURIComponent(itemUrl)}`;
   let url = first;
   for (let i = 0; i < 8; i += 1) {
-    const { status, data } = await neodbGet(ctx, url, true);
+    const { status, data } = await neodbGet(ctx, url, true, settings);
     if (status >= 200 && status < 300 && data && typeof data.uuid === 'string') return data;
     const next = pollUrlOf(data, status);
     if (!next || status === 0) {
@@ -351,16 +371,24 @@ export async function resolve(
   const parsed = parseCardUrl(url);
   if (!parsed) return null;
   const force = Boolean(opts?.force);
+  // Keep one slot per item; authenticated marks and localized fields require the same settings.
+  const [token, language] = await Promise.all([tokenOf(ctx), languageOf(ctx)]);
+  const settings = { token, language };
+  const scope = createHash('sha256')
+    // Invalidate snapshots cached before mark failures were distinguished from absence.
+    .update(JSON.stringify(['public-marks-v3', token, language]))
+    .digest('hex');
 
   if (parsed.kind === 'neodb') {
     if (!force) {
       const cached = await items(ctx).get(parsed.uuid);
-      if (fresh(cached)) return cached;
+      if (fresh(cached, scope)) return cached;
     }
     const { status, data } = await neodbGet(
       ctx,
       `https://neodb.social/api/${parsed.type}/${parsed.uuid}`,
       false,
+      settings,
     );
     if (status !== 200 || !data) {
       ctx.log.info(`fail ${parsed.type}/${parsed.uuid}`);
@@ -368,27 +396,27 @@ export async function resolve(
     }
     const snap = mapItem(data, parsed.type, parsed.uuid);
     if (!snap) return null;
-    const filled = await withMark(ctx, snap, parsed.uuid);
-    await items(ctx).put(parsed.uuid, filled);
+    const filled = await withMark(ctx, snap, parsed.uuid, settings);
+    await items(ctx).put(parsed.uuid, { ...filled, cacheScope: scope });
     ctx.log.info(`item ${parsed.type}/${parsed.uuid}`);
     return filled;
   }
 
-  const data = await catalogFetch(ctx, parsed.url);
+  const data = await catalogFetch(ctx, parsed.url, settings);
   if (!data) return null;
   const uuid = String(data.uuid ?? '');
   if (!uuid) return null;
   if (!force) {
     const cached = await items(ctx).get(uuid);
-    if (fresh(cached)) return cached;
+    if (fresh(cached, scope)) return cached;
   }
   const type =
     parseNeodbUrl(typeof data.url === 'string' ? data.url : '')?.type ||
     String(data.category ?? 'movie');
   const snap = mapItem(data, type, uuid);
   if (!snap) return null;
-  const filled = await withMark(ctx, snap, uuid);
-  await items(ctx).put(uuid, filled);
+  const filled = await withMark(ctx, snap, uuid, settings);
+  await items(ctx).put(uuid, { ...filled, cacheScope: scope });
   ctx.log.info(`catalog ${uuid}`);
   return filled;
 }

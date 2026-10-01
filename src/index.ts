@@ -33,6 +33,8 @@ export function createPlugin() {
       pages: [{ path: '/refresh', label: 'NeoDB', icon: 'book' }],
       settingsSchema: {
         token: { type: 'secret', label: 'NeoDB token' },
+        mediaToken: { type: 'secret', label: 'Media API token', description: 'EmDash token with media:read and media:write scopes for automatic poster archiving.' },
+        internalToken: { type: 'secret', label: 'Internal SSR token' },
         language: {
           type: 'select',
           label: 'Language',
@@ -66,7 +68,7 @@ export function createPlugin() {
     routes: {
       shelf: {
         public: true,
-        cacheControl: 'public, max-age=300',
+        cacheControl: 'no-store',
         input: shelfInput,
         handler: shelfHandler,
       },
